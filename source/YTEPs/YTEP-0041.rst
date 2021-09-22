@@ -1,0 +1,235 @@
+YTEP-0041: Dask
+========================
+
+To write a YTEP, copy this template to the next numerical number, add it to the
+repository, and issue a pull request.  Discussion of the YTEP will occur either
+on the mailing list (for large-scale changes) or in the PR itself (small items,
+such as formatting).
+
+
+Abstract
+--------
+
+Created: September 2, 2021
+Author: Chris Havlin
+
+This YTEP uses dask to streamline chunk-related operations.
+
+
+Status
+------
+
+Proposed 
+
+ #. Proposed
+ #. Completed
+ #. In Progress
+ #. Declined
+
+YTEPs do not need to pass through every stage.
+
+Project Management Links
+------------------------
+
+Any external links to:
+
+  * Pull requests
+  * Related issues in the bug tracker
+  * Previous implementations
+  * Mailing list discussions or Google Docs
+
+Discussion links:
+
+* dask dev branch: https://github.com/yt-project/yt/tree/daskening
+* dask functionality for unyt arrays: https://github.com/yt-project/unyt/pull/185
+
+Prototype links:
+
+* `Dask + yt pre-YTEP <https://hackmd.io/@chavlin/r1E_o6lAv>`_
+* scipy 2021 presentation, `On the Daskening of yt <https://chrishavlin.github.io/scipy2021>`_
+
+PR links:
+
+* initial dask PR: `3511 <https://github.com/yt-project/yt/pull/3511>`_, this PR implements a daskified particle read and some related improvements, including:
+
+  * refactor of the general `_read_particle_fields` method to use a delayed dask 
+  * complimentary refactor of Gadget IO (separates data read from selector application)
+  * introduces delayed dask-unyt arrays to the yt stack (relying on `unyt PR 185 <https://github.com/yt-project/unyt/pull/185>`_)
+  * introduces a Dask `Client` context manager 
+  
+* pickleability (merged): `3124 <https://github.com/yt-project/yt/pull/3124>`_, `2934 <https://github.com/yt-project/yt/pull/2934>`_
+* dask-unyt arrays: `unyt PR 185 <https://github.com/yt-project/unyt/pull/185>`_
+
+Detailed Description
+--------------------
+
+Here is where you should write detailed description of what the YTEP proposes.
+This needs to include:
+
+Background
+----------
+
+
+This YTEP proposes integration of Dask into the yt stack. The aim is to simplify aspects of dataset access allowing more streamlined frontend development and distributed algorithms. 
+
+Nature of the problem
+---------------------
+
+Not "problems" per se, but:
+
+* yt's parallelism relies on MPI, requiring MPI to be installed and configured. While not generally an issue, having an out of the box parallel package using Dask has its advantages for distribution in modern cloud frameworks.
+* developing distributed algorithms is not always straightforward.
+* the chunking iteration used in IO is confusing, as evidence by the frequent conversion of the `chunk` iterator to flat lists in the yt stack. 
+
+Nature of the solution
+----------------------
+
+The solution here is to refactor the reading (and necessarily chunking) operations to construct delayed dask operations. Where appropriate, the delayed reads can either be immediately executed to construct in-memory unyt arryas or a delayed dask-unyt array can be returned downstream to other parts of the yt stack and even returned to the end user for constructing custom distributed operations. 
+
+
+Overview of IO and distributed dask arrays
+==========================================
+
+Reading data in a Dask context is conceptually straightforward using Dask's ``delayed`` decorator with yt's existing chunking infrastructure. In pseudo-code, the following creates:
+::
+
+    delayed_chunk_reads = []
+    for chunk in ds: 
+        delayed_chunk_reads.append(dask.delayed(read_single_chunk)(chunk))
+
+where ``read_single_chunk`` is a method defined for the dataset for reading data from a single chunk. The result of the above loop is a list of delayed objects comprising a task graph that contains the instructions for assembling each chunk. Further operations such as application of selector objects can be applied by chunk as further delayed operations. 
+
+The final operation is to convert the delayed chunks into an array. This point though, requires a choice that has implications for the whole yt stack: should our daskified reads return in-memory unyt arrays or pass out delayed arrays?
+
+Creating in-memory unyt arrays from delayed chunks is straightforward -- calling ``dask.compute(*delayed_chunk_reads)`` will execute our distributed read by chunk and we can concatenate the resulting numpy arrays and build the expected unyt arrays. This route is a minimally invasive change and is thus the first implementation step.
+
+With the introduction of unyt-dask arrays (`PR in review<https://github.com/yt-project/unyt/pull/185>`_), however, we will have the option of returning delayed arrays to use downstream throughout yt or to expose directly to the user. The basic construction is to use ``dask.array.from_delayed()`` to build a delayed `Dask [Array] <https://docs.dask.org/en/latest/array.html>`_. The advantage of returning Dask arrays is that subsequent uses of the array will be added to the distributed dask graph, allowing straightforward construction of distributed algorithms at least for standard array operations (e.g., adding arrays, finding averages of fields). More complex distributed algorithms may require using additional `dask.delayed` workflows.
+
+Implementation
+--------------
+
+Per email and slack community discussion (find the link), development will generally occur via PR submission to the ``daskening`` branch of the main yt repository with more general changes that are not specific to Dask submitted to the `main` branch. 
+
+The following steps outline the development path. Work may be done on the different steps concurrently, but for clarity they are described linearly in this YTEP: 
+
+* Dependency updates
+* Dataset serialization and caching 
+* Particle IO: chunk + index refactoring, frontend refactoring
+* Grid IO
+* Using delayed arrays throughout the yt stack
+* Dask `Client` management
+
+
+Dependency Updates
+==================
+
+This YTEP introduces Dask as a hard dependency. Minimal usage only requires the ``dask[array]`` install, but typical usage will benefit from ``dask[array,distributed,diagnostics]`` (the only difference from a ``complete`` install here is the ``dataframe`` related requirements are skipped). 
+
+To do: add the hard dependency to yt, update testing configuration. This should happen in the current PR. no reason not to. Do it.
+
+
+Dataset serialization and caching 
+=================================
+
+There are two aspects to how Dask passes and shares objects between distributed processes important to this YTEP: general serialization of objects and management of yt dataset instances. 
+
+In terms of serialization, the default behavior of Dask is to use pickle. While there are other protocols as well as the ability to use custom protocols (see the Dask documentation on [serialization](https://distributed.dask.org/en/latest/serialization.html), there's not a compelling reason to not use pickle. This does, however, necessitate that objects being used in dask operations must be pickleable. Several PRs were merged some time ago (`2934 <https://github.com/yt-project/yt/pull/3124>`_, `3124 <https://github.com/yt-project/yt/pull/2934>`_) to improve dataset and selection object pickleability. There may be more work to do in improving pickelability of yt objects.
+
+The second aspect, management of yt dataset instances, refers to yt's caching mechanisms for dataset instances. When sending a dataset object, ``ds``, to a Dask process, ``ds`` will be packed and unpacked with pickle on each worker. When unpacking ``ds``, yt checks the `ParameterFileStore <https://github.com/yt-project/yt/blob/main/yt/utilities/parameter_file_storage.py>`_. Using the default behavior of an in-memory ``ParameterFileStore`` with Dask results in communication errors for distributed processes as the ``ParameterFileStore`` exists only on the main process. At present, the workaround is to use the ``StoreParameterFiles`` configuration option so that the dataset arguments for re-instiating dataset objects can be read by each process (note that `2954 <https://github.com/yt-project/yt/pull/2954>`_ got this working again). But alternatively, the ``ParameterFileStore`` should be refactored to work in a Dask context, similar to how the MPI context handles datasets. 
+
+
+Particle IO
+===========
+
+The discussion on `Daskified reads <https://chrishavlin.github.io/scipy2021/02_daskifiedread.html>`_ provides a general overview of the proposed approach, but it is repeated and expanded on here. As it stands, the 
+
+
+Base `ParticleIndex` class refactoring
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``yt.geometry.particle_geometry_handler.ParticleIndex._read_particle_fields``
+
+In pseudo-code, the refactored ``_read_particle_fields`` is as follows:
+::
+
+    def _read_particle_fields(self, fields, dobj, chunk=None):
+         data_file_subset = list of datafiles interesting the selector (initially culls datafiles not hit by selector )
+
+         dask_array_dict =  = self.io._read_from_datafiles(
+             data_file_subset, fields
+         )
+         # read all the data from the intersecting data_files into delayed dask arrays
+         fields_to_return = self.io._read_from_datafiles(
+             data_file_subset, fields_to_read
+         )
+
+         # find the particles within the selector
+         if is_all_data is False:
+             fields_to_return = self.apply_selector_mask(fields_to_return, dobj.selector)
+
+         return fields_to_return, fields_to_generate
+
+
+
+
+Frontend refactoring
+~~~~~~~~~~~~~~~~~~~~
+
+The refactoring of `_read_particle_fields` (and the grid equivalent) requires minimally refactoring each frontend. The initial PR accomplishes this for the Gadget frontend. The main change is a requirement to remove the chunk iteration within the IO reads. In the case of Gadget, 
+
+``yt.frontends.gadget.io._read_particle_fields``
+
+
+Grid IO
+=======
+
+Concurrent to Particle IO refactoring, there should be equivalent development for grid-based frontends. What does that entail?
+
+Using delayed arrays throughout the yt stack
+============================================
+
+Once internal calls to fetch data can return dask arrays, those dask arrays can be used throughout yt to simplify existing code that depend on the chunking infrastructure or to write new distributed code using array-like syntax. The * `Dask + yt pre-YTEP <https://hackmd.io/@chavlin/r1E_o6lAv>`_ demonstrated a use-case of in a daskified `profile calculation <https://hackmd.io/@chavlin/BJDVGiX0P>`_ that applies yt's parallel-optimized yt.utilities.lib.misc_utilities.new_binprofile1d to a dask array. While of similar complexity to the existing MPI implementation, refactoring the binning functionality to use the daskified approach extends yt's distributed use beyond just MPI. 
+
+
+Dask `Client` management 
+========================
+
+The default Dask ``localcluster`` uses multi-threading but many datasets may not support concurrent reads. Thus, it would be helpful to provide a yt-safe default ``Client``. In `3511 <https://github.com/yt-project/yt/pull/3511>`_ this is accomplished with a new context manager, ``yt.utilities.parallel_tools.dask_helper`` (`link to file <https://github.com/yt-project/yt/blob/74c3f462d91987bfdb528e6cac5b8e4f91faa10d/yt/utilities/parallel_tools/dask_helper.py>`_). This context manager addresses two related issues: (1) when one calls ``dask.compute``, a default client will automatically spin up and (2) Dask does not have a conventional way of checking for existing schedulers (see `here <https://stackoverflow.com/a/49820995/9357244>`_).So the new ``dask_helper`` namespace provides, among other things, a context manager ``dask_client`` and a wrapper for ``dask.compute`` called `dask_helper.compute` to address these complications. 
+
+The recommended way of starting a Dask client will be to use ``dask_client.start_client``, a wrapper to the standard Dask client launcher that ensures a yt-safe client. The open client object is then stored in ``dask_client.client``. As this spawns a normal dask client, that client will be used by any other Dask processes in the current session.
+
+The ``dask_helper.compute`` simply checks ``dask_client`` and spins up a yt-safe ``Client`` if none exists in order to avoid the default Dask client.
+
+Code Examples: 
+
+
+Testing
+-------
+
+Refactored code should pass existing tests. 
+New tests for new features: 
+* returning dask arrays
+* parallel processing 
+
+
+Stumbling Points
+----------------
+
+
+Community Outreach
+------------------
+
+  * Background
+  * Nature of the problem
+  * Nature of the solution
+  * How will the solution be implemented
+    * Brief outline of the code needed to implement this
+    * Code examples of using the solution, in appropriate
+    * How will the solution be tested?
+  * What are any stumbling points
+  * What is the proposed method for reaching out to the community about this?
+
+Backwards Compatibility
+-----------------------
+
+Single-processor scripts and notebooks should work as is. Parallel scripts and notebooks using MPI will need minor modifications and an additional dependency on [dask-mpi](https://mpi.dask.org/).
