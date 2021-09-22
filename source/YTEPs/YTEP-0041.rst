@@ -141,13 +141,24 @@ The second aspect, management of yt dataset instances, refers to yt's caching me
 Particle IO
 ===========
 
-The discussion on `Daskified reads <https://chrishavlin.github.io/scipy2021/02_daskifiedread.html>`_ provides a general overview of the proposed approach, but it is repeated and expanded on here. As it stands, the 
+The discussion on `Daskified reads <https://chrishavlin.github.io/scipy2021/02_daskifiedread.html>`_ provides a general overview of the proposed approach, but it is repeated and expanded on here. As it stands, when reading particle data for a selection, the following sequence happens:
+
+* use Morton Indexing to find ``datafile`` objects intersecting a ``selector`` object.
+* iterate over the intersecting ``datafile`` objects. For each ``datafile``, load in positions and create an array mask by applying the ``selector`` object. Apply the ``selector`` mask to return desired fields. 
+
+This approach closely ties the frontend-specific data IO methods to the ``selector`` application. But using Dask, we can split these operations into 3 sequential steps:
+
+* use Morton Indexing to find ``datafile`` objects intersecting a ``selector`` object.
+* iterate over the intersecting ``datafile`` objects, create a delayed array where each chunk is the full data for a ``datafile`` object.  
+* apply the ``selector`` object by chunk to the Dask array. 
+
+because the application by chunk constructs independent graphs in a delayed array, the selections are still applied to each chunk individually, maintaining the existing performance but simplifying the code. This refactoring requires changes to the base ``ParticleIndex`` class and changes to each frontend's ``io._read_particle_fields`` method, as described in the following. 
 
 
-Base `ParticleIndex` class refactoring
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Base ``ParticleIndex`` class refactoring
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``yt.geometry.particle_geometry_handler.ParticleIndex._read_particle_fields``
+The main change to the ``ParticleIndex`` class in `3511 <https://github.com/yt-project/yt/pull/3511>`_ is to ``yt.geometry.particle_geometry_handler.ParticleIndex._read_particle_fields``. 
 
 In pseudo-code, the refactored ``_read_particle_fields`` is as follows:
 ::
@@ -169,15 +180,14 @@ In pseudo-code, the refactored ``_read_particle_fields`` is as follows:
 
          return fields_to_return, fields_to_generate
 
-
+The new method, ``yt.utilities.io_handler.BaseIOHandler._read_from_datafiles`` builds a delayed dask array by assembling a list of delayed calls to the familiar but slightly refactored `io._read_particle_fields()` for each array chunk. After the delayed dask array is constructed, ``apply_selector_mask`` applies any selector to the new array by-chunk.
+   
 
 
 Frontend refactoring
 ~~~~~~~~~~~~~~~~~~~~
 
-The refactoring of `_read_particle_fields` (and the grid equivalent) requires minimally refactoring each frontend. The initial PR accomplishes this for the Gadget frontend. The main change is a requirement to remove the chunk iteration within the IO reads. In the case of Gadget, 
-
-``yt.frontends.gadget.io._read_particle_fields``
+The refactoring of ``ParticleIndex._read_particle_fields`` (and the grid equivalent) requires minimally refactoring each frontend. The initial PR accomplishes this for the Gadget frontend. The main change is a requirement to remove the chunk iteration within the IO reads. In the case of Gadget, `3511 <https://github.com/yt-project/yt/pull/3511>`_ refactors ``yt.frontends.gadget.io._read_particle_fields`` to remove the application of any selector objects and chunk iteration, so that the refactored version simply reads from a single datafile object (note: index ranges are still passed in). Thus, the `ParticleIndex` refactoring necessitates a similar refactoring for all the frontends. 
 
 
 Grid IO
@@ -200,8 +210,8 @@ The recommended way of starting a Dask client will be to use ``dask_client.start
 
 The ``dask_helper.compute`` simply checks ``dask_client`` and spins up a yt-safe ``Client`` if none exists in order to avoid the default Dask client.
 
-Code Examples: 
-
+Code Examples 
+-------------
 
 Testing
 -------
@@ -232,4 +242,4 @@ Community Outreach
 Backwards Compatibility
 -----------------------
 
-Single-processor scripts and notebooks should work as is. Parallel scripts and notebooks using MPI will need minor modifications and an additional dependency on [dask-mpi](https://mpi.dask.org/).
+Single-processor scripts and notebooks should work as is. Parallel scripts and notebooks using MPI will need minor modifications and an additional dependency on `dask-mpi <https://mpi.dask.org/>`_.
